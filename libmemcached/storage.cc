@@ -38,6 +38,17 @@ enum memcached_storage_action_t {
   CAS_OP
 };
 
+struct memcached_storage_request_st {
+   memcached_storage_action_t verb;
+   char *key;
+   size_t key_length;
+   char *value;
+   size_t value_length;
+   time_t expiration;
+   uint32_t flags;
+   uint64_t cas;
+ };
+
 /* Inline this */
 static inline const char *storage_op_string(memcached_storage_action_t verb)
 {
@@ -257,7 +268,8 @@ static memcached_return_t memcached_send_ascii(memcached_st *ptr,
                                                const time_t expiration,
                                                const uint32_t flags,
                                                const uint64_t cas,
-                                               memcached_storage_action_t verb)
+                                               memcached_storage_action_t verb,
+                                               memcached_server_write_instance_st *instance_ret)
 {
   char flags_buffer[MEMCACHED_MAXIMUM_INTEGER_DISPLAY_LENGTH +1];
   int flags_buffer_length= snprintf(flags_buffer, sizeof(flags_buffer), " %u", flags);
@@ -321,11 +333,9 @@ static memcached_return_t memcached_send_ascii(memcached_st *ptr,
   }
 
   uint32_t server_key= memcached_generate_hash_with_redistribution(ptr, group_key, group_key_length);
-  memcached_server_write_instance_st instance= memcached_server_instance_fetch(ptr, server_key);
+  *instance_ret = memcached_server_instance_fetch(ptr, server_key);
+  memcached_server_write_instance_st instance = *instance_ret;
 
-#ifdef ENABLE_REPLICATION
-do_action:
-#endif
   WATCHPOINT_SET(instance->io_wait_count.read= 0);
   WATCHPOINT_SET(instance->io_wait_count.write= 0);
 
@@ -357,29 +367,28 @@ do_action:
     {
       rc= MEMCACHED_BUFFERED;
     }
-    else
-    {
-      char result[MEMCACHED_DEFAULT_COMMAND_SIZE];
-      rc= memcached_response(instance, result, MEMCACHED_DEFAULT_COMMAND_SIZE, NULL);
-
-      if (rc == MEMCACHED_STORED)
-      {
-        rc= MEMCACHED_SUCCESS;
-      }
-#ifdef ENABLE_REPLICATION
-      else if (rc == MEMCACHED_SWITCHOVER or rc == MEMCACHED_REPL_SLAVE)
-      {
-        ZOO_LOG_INFO(("Switchover: hostname=%s port=%d error=%s",
-                      instance->hostname, instance->port, memcached_strerror(ptr, rc)));
-        if (memcached_rgroup_switchover(ptr, instance) == true) {
-          instance= memcached_server_instance_fetch(ptr, server_key);
-          goto do_action;
-        }
-      }
-#endif
-    }
   }
+  return rc;
+}
 
+static memcached_return_t memcached_recv_ascii(memcached_st *ptr,
+                                               memcached_server_write_instance_st instance,
+                                               bool *need_resend)
+{
+  memcached_return_t rc;
+  *need_resend = false;
+  char result[MEMCACHED_DEFAULT_COMMAND_SIZE];
+  rc = memcached_response(instance, result, MEMCACHED_DEFAULT_COMMAND_SIZE, NULL);
+  if (rc == MEMCACHED_STORED) {
+    rc = MEMCACHED_SUCCESS;
+  }
+#ifdef ENABLE_REPLICATION
+  else if (rc == MEMCACHED_SWITCHOVER or rc == MEMCACHED_REPL_SLAVE) {
+    ZOO_LOG_INFO(("Switchover: hostname=%s port=%d error=%s",
+                  instance->hostname, instance->port, memcached_strerror(ptr, rc)));
+    *need_resend = memcached_rgroup_switchover(ptr, instance);
+  }
+#endif
   return rc;
 }
 
@@ -419,13 +428,90 @@ static inline memcached_return_t memcached_send(memcached_st *ptr,
   }
   else
   {
-    rc= memcached_send_ascii(ptr, group_key, group_key_length,
-                             key, key_length,
-                             value, value_length, expiration,
-                             flags, cas, verb);
+    memcached_server_write_instance_st instance;
+    bool need_resend = false;
+    do {
+      rc = memcached_send_ascii(ptr, group_key, group_key_length,
+                               key, key_length,
+                               value, value_length, expiration,
+                               flags, cas, verb, &instance);
+      if (rc == MEMCACHED_SUCCESS) {
+        rc = memcached_recv_ascii(ptr, instance, &need_resend);
+      }
+    } while(need_resend);
   }
 
   return rc;
+}
+
+static inline memcached_return_t memcached_msend(memcached_st *ptr,
+                                                 memcached_storage_request_st *reqs,
+                                                 size_t num_of_req,
+                                                 memcached_return_t *results)
+{
+  arcus_server_check_for_update(ptr);
+
+  // FIXME
+  char **keys = NULL;
+  size_t *key_length = NULL;
+  ALLOCATE_ARRAY_OR_RETURN(ptr, keys, char*, num_of_req);
+  ALLOCATE_ARRAY_OR_RETURN(ptr, key_length, size_t, num_of_req);
+  for (size_t i = 0; i < num_of_req; i++) {
+    keys[i] = reqs[i].key;
+    key_length[i] = reqs[i].key_length;
+  }
+  memcached_return_t rc = before_query(ptr, keys, key_length, num_of_req);
+  DEALLOCATE_ARRAY(ptr, keys);
+  DEALLOCATE_ARRAY(ptr, key_length);
+  if (rc != MEMCACHED_SUCCESS) {
+    return rc;  // binary or udp: Fail here (unsupported)
+  }
+
+  size_t remain_req = num_of_req;
+
+  memcached_server_write_instance_st *instances;
+  ALLOCATE_ARRAY_OR_RETURN(ptr, instances, memcached_server_write_instance_st, num_of_req);
+  for (size_t i = 0; i < num_of_req; i++) {
+    results[i] = MEMCACHED_MAXIMUM_RETURN;
+  }
+
+  // send
+  for (size_t i = 0; i < num_of_req; i++) {
+    rc = memcached_send_ascii(ptr, NULL, 0,
+                              reqs[i].key, reqs[i].key_length,
+                              reqs[i].value, reqs[i].value_length,
+                              reqs[i].expiration, reqs[i].flags,
+                              reqs[i].cas,reqs[i].verb,
+                              &instances[i]);
+    if (rc != MEMCACHED_SUCCESS) {
+      results[i] = rc;
+      remain_req--;
+    }
+  }
+
+  // recv
+  while (remain_req > 0) {
+    for (size_t i = 0; i < num_of_req; i++) {
+      if (results[i] != MEMCACHED_MAXIMUM_RETURN) {
+        continue;  // already processed
+      }
+      bool need_resend = false;
+      rc = memcached_recv_ascii(ptr, instances[i], &need_resend);
+      if (need_resend) {
+        rc = memcached_send_ascii(ptr, NULL, 0,
+                                  reqs[i].key, reqs[i].key_length,
+                                  reqs[i].value, reqs[i].value_length,
+                                  reqs[i].expiration, reqs[i].flags,
+                                  reqs[i].cas,reqs[i].verb,
+                                  &instances[i]);
+      } else {
+        results[i] = rc;
+        remain_req--;
+      }
+    }
+  }
+
+  return MEMCACHED_SUCCESS;  // FIXME
 }
 
 
