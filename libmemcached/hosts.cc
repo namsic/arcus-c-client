@@ -212,10 +212,14 @@ static int continuum_item_cmp(const void *t1, const void *t2)
     }
 #endif
     if (cmp_servers != NULL) {
-      int return_value= strcmp(cmp_servers[ct1->index].hostname, cmp_servers[ct2->index].hostname);
-      if (return_value == 0)
-        return_value= strcmp(cmp_servers[ct1->index].str_port, cmp_servers[ct2->index].str_port);
-      return return_value;
+      /* must match the server's ordering of duplicate hash points */
+      char hostport1[MEMCACHED_MAX_HOST_SORT_LENGTH];
+      char hostport2[MEMCACHED_MAX_HOST_SORT_LENGTH];
+      snprintf(hostport1, sizeof(hostport1), "%s:%s",
+               cmp_servers[ct1->index].hostname, cmp_servers[ct1->index].str_port);
+      snprintf(hostport2, sizeof(hostport2), "%s:%s",
+               cmp_servers[ct2->index].hostname, cmp_servers[ct2->index].str_port);
+      return strcmp(hostport1, hostport2);
     }
 #endif
     return 0;
